@@ -1,12 +1,11 @@
-#!/usr/bin/python3
 """
-~~~~~~~~~~~~~~~~~~
-Camera calibration
-~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Fisheye Camera calibration
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Usage:
-    python calib.py \
-        -i /dev/video0 \
+    python calibrate_camera.py \
+        -i 0 \
         -grid 9x6 \
         -out fisheye.yaml \
         -framestep 20 \
@@ -16,51 +15,76 @@ Usage:
 import argparse
 import os
 import numpy as np
-import yaml
 import cv2
+from surround_view import CaptureThread, MultiBufferManager
+import surround_view.utils as utils
+
+
+# we will save the camera param file to this directory
+TARGET_DIR = os.path.join(os.getcwd(), "yaml")
+
+# default param file
+DEFAULT_PARAM_FILE = os.path.join(TARGET_DIR, "camera_params.yaml")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", default=0, help="input video file or camera device")
-    parser.add_argument("-grid", "--grid", default="20x20", help="size of the grid (rows x cols)")
-    parser.add_argument("-framestep", type=int, default=20, help="use every nth frame in the video")
-    parser.add_argument("-o", "--output", default="./yaml",
+
+    # input video stream
+    parser.add_argument("-i", "--input", type=int, default=0,
+                        help="input camera device")
+
+    # chessboard pattern size
+    parser.add_argument("-grid", "--grid", default="9x6",
+                        help="size of the calibrate grid pattern")
+
+    parser.add_argument("-framestep", type=int, default=20,
+                        help="use every nth frame in the video")
+
+    parser.add_argument("-o", "--output", default=DEFAULT_PARAM_FILE,
                         help="path to output yaml file")
-    parser.add_argument("-resolution", "--resolution", default="640x480",
-                        help="resolution of the camera")
+
     parser.add_argument("-fisheye", "--fisheye", action="store_true",
                         help="set ture if this is a fisheye camera")
 
+    parser.add_argument("-flip", "--flip", default=0, type=int,
+                        help="flip method of the camera")
+
     args = parser.parse_args()
 
-    if not os.path.exists(args.output):
-        os.mkdir(args.output)
+    if not os.path.exists(TARGET_DIR):
+        os.mkdir(TARGET_DIR)
 
-    try:
-        source = cv2.VideoCapture(int(args.input))
-    except:
-        source = cv2.VideoCapture(args.input)
-
-    W, H = [int(x) for x in args.resolution.split("x")]
-    source.set(3, W)
-    source.set(4, H)
+    text1 = "press c to calibrate"
+    text2 = "press q to quit"
+    text3 = "device: {}".format(args.input)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fontscale = 0.6
 
     grid_size = tuple(int(x) for x in args.grid.split("x"))
-    grid_points = np.zeros((np.prod(grid_size), 3), np.float32)
-    grid_points[:, :2] = np.indices(grid_size).T.reshape(-1, 2)
+    grid_points = np.zeros((1, np.prod(grid_size), 3), np.float32)
+    grid_points[0, :, :2] = np.indices(grid_size).T.reshape(-1, 2)
 
     objpoints = []  # 3d point in real world space
     imgpoints = []  # 2d points in image plane
+
+    device = args.input
+    cap_thread = CaptureThread(device_id=device,
+                               flip_method=args.flip)
+    buffer_manager = MultiBufferManager()
+    buffer_manager.bind_thread(cap_thread, buffer_size=8)
+    if cap_thread.connect_camera():
+        cap_thread.start()
+    else:
+        print("cannot open device")
+        return
 
     quit = False
     do_calib = False
     i = -1
     while True:
         i += 1
-        retcode, img = source.read()
-        if not retcode:
-            raise ValueError("cannot read frame from video")
+        img = buffer_manager.get_device(device).get().image
         if i % args.framestep != 0:
             continue
 
@@ -77,16 +101,13 @@ def main():
             term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_COUNT, 30, 0.01)
             cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), term)
             print("OK")
-            imgpoints.append(corners.reshape(1, -1, 2))
-            objpoints.append(grid_points.reshape(1, -1, 3))
+            imgpoints.append(corners)
+            objpoints.append(grid_points)
             cv2.drawChessboardCorners(img, grid_size, corners, found)
-        text1 = "press c to calibrate"
-        text2 = "press q to quit"
-        text3 = "device: {}".format(args.input)
-        fontscale = 0.6
-        cv2.putText(img, text1, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, fontscale, (255, 200, 0), 2)
-        cv2.putText(img, text2, (20, 110), cv2.FONT_HERSHEY_SIMPLEX, fontscale, (255, 200, 0), 2)
-        cv2.putText(img, text3, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, fontscale, (255, 200, 0), 2)
+
+        cv2.putText(img, text1, (20, 70), font, fontscale, (255, 200, 0), 2)
+        cv2.putText(img, text2, (20, 110), font, fontscale, (255, 200, 0), 2)
+        cv2.putText(img, text3, (20, 30), font, fontscale, (255, 200, 0), 2)
         cv2.imshow("corners", img)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("c"):
@@ -98,7 +119,8 @@ def main():
             break
 
     if quit:
-        source.release()
+        cap_thread.stop()
+        cap_thread.disconnect_camera()
         cv2.destroyAllWindows()
 
     if do_calib:
@@ -116,7 +138,6 @@ def main():
                              cv2.fisheye.CALIB_CHECK_COND +
                              cv2.fisheye.CALIB_FIX_SKEW)
 
-        # 求出内参矩阵和畸变系数
         if args.fisheye:
             ret, mtx, dist, rvecs, tvecs = cv2.fisheye.calibrate(
                 objpoints,
@@ -136,18 +157,18 @@ def main():
                 (W, H),
                 None,
                 None)
-        if ret:
-            print(ret)
-            data = {"dim": np.array([W, H]).tolist(), "K": K.tolist(), "D": D.tolist()}
-            fname = os.path.join(args.output, "camera" + str(args.input) + ".yaml")
-            print(fname)
-            with open(fname, "w") as f:
-                yaml.safe_dump(data, f)
-            print("succesfully saved camera data")
 
-            cv2.putText(img, "Success!", (220 , 240), cv2.FONT_HERSHEY_COMPLEX, 2, (0, 0, 255), 2)
+        if ret:
+            fs = cv2.FileStorage(args.output, cv2.FILE_STORAGE_WRITE)
+            fs.write("resolution", np.int32([W, H]))
+            fs.write("camera_matrix", K)
+            fs.write("dist_coeffs", D)
+            fs.release()
+            print("succesfully saved camera data")
+            cv2.putText(img, "Success!", (220, 240), font, 2, (0, 0, 255), 2)
+
         else:
-            cv2.putText(img, "Failed!", (220, 240), cv2.FONT_HERSHEY_COMPLEX, 2, (0, 0, 255), 2)
+            cv2.putText(img, "Failed!", (220, 240), font, 2, (0, 0, 255), 2)
 
         cv2.imshow("corners", img)
         cv2.waitKey(0)
